@@ -85,18 +85,46 @@ def evaluate_antibiotics_with_confidence_intervals(X_train, X_test, train, test,
     - A dictionary containing evaluation results and confidence intervals for each antibiotic.
     """
     results = {}
-    for antibiotic in tqdm(antibiotics,desc="Iterating through Antibiotics Progress: "):
+    
+    for antibiotic in tqdm(antibiotics, desc="Iterating through Antibiotics Progress: "):
         y_train = train[antibiotic].astype(int).reset_index(drop=True)
         y_test = test[antibiotic].astype(int).reset_index(drop=True)
         
-        # Initialize and fit the model
-        model = LGBMClassifier(n_estimators=1000, learning_rate=0.05, num_leaves=30)
-        model.fit(X_train, y_train)
+        # Fine-tuning
+        model = AutoModel.from_pretrained(model_name)
+        optimizer = AdamW(model.parameters(), lr=2e-5)
+        num_training_steps = len(X_train) * epochs
+        lr_scheduler = get_scheduler(
+            "linear",
+            optimizer=optimizer,
+            num_warmup_steps=0,
+            num_training_steps=num_training_steps
+        )
         
-        # Predict on test set and calculate probabilities
-        y_test_proba = model.predict_proba(X_test)[:, 1]
-
-        # Initial evaluation
+        model.train()
+        for epoch in range(epochs):
+            for i in range(0, len(X_train), batch_size):
+                batch_texts = X_train[i:i+batch_size]
+                batch_labels = y_train[i:i+batch_size]
+                
+                _ = encode_texts(model_name, batch_texts, batch_labels, fine_tune=True)
+                
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+        
+        # Generate embeddings using fine-tuned model
+        X_train_embeddings = encode_texts(model_name, X_train)
+        X_test_embeddings = encode_texts(model_name, X_test)
+        
+        # Train LightGBM classifier
+        lgbm_model = LGBMClassifier(n_estimators=1000, learning_rate=0.05, num_leaves=30)
+        lgbm_model.fit(X_train_embeddings, y_train)
+        
+        # Predict using LightGBM
+        y_test_proba = lgbm_model.predict_proba(X_test_embeddings)[:, 1]
+        
+        # The rest of the evaluation code remains the same
         precision, recall, thresholds = precision_recall_curve(y_test, y_test_proba)
         f1_scores = 2 * recall * precision / (recall + precision)
         f1_scores = np.nan_to_num(f1_scores)
