@@ -1,6 +1,12 @@
 import numpy as np
 from sklearn.metrics import matthews_corrcoef, roc_auc_score, average_precision_score, precision_recall_curve, roc_curve, auc
 from lightgbm import LGBMClassifier
+from transformers import (
+    AutoModel, AutoModelForSequenceClassification, AutoTokenizer, AutoConfig, 
+    DataCollatorWithPadding, TrainingArguments, Trainer, TextClassificationPipeline, 
+    AdamW, get_scheduler, pipeline, RobertaTokenizerFast
+)
+from scripts.encoder import encode_texts, encode_texts_biolm
 
 def evaluate_antibiotics(X_train, X_test, train, test, antibiotics):
     """
@@ -62,80 +68,98 @@ def evaluate_antibiotics(X_train, X_test, train, test, antibiotics):
         }
     return results
 
-import numpy as np
-from sklearn.metrics import matthews_corrcoef, roc_auc_score, average_precision_score, precision_recall_curve, roc_curve, auc
+import torch
+from transformers import AutoModelForSequenceClassification, AdamW, get_scheduler, AutoTokenizer
+from sklearn.metrics import precision_recall_curve, matthews_corrcoef, roc_auc_score, average_precision_score, roc_curve, auc
 from sklearn.utils import resample
 from lightgbm import LGBMClassifier
+import numpy as np
 from tqdm import tqdm
 
-def evaluate_antibiotics_with_confidence_intervals(X_train, X_test, train, test, antibiotics, n_bootstraps=1000):
+def evaluate_antibiotics_with_confidence_intervals(X_train, X_test, train, test, antibiotics, model_name='distilbert-base-uncased', n_bootstraps=1000):
     """
     Function to train and evaluate a model for each antibiotic in the list, including confidence intervals
     for metrics using bootstrapping.
 
     Parameters:
-    - X_train: Features for the training set
-    - X_test: Features for the testing set
-    - train: Training dataset containing the targets
-    - test: Testing dataset containing the targets
+    - X_train: List of text data for the training set
+    - X_test: List of text data for the testing set
+    - train: DataFrame containing the training targets
+    - test: DataFrame containing the testing targets
     - antibiotics: List of antibiotics to evaluate
+    - model_name: Pretrained model name
     - n_bootstraps: Number of bootstrap samples to use for confidence intervals
 
     Returns:
     - A dictionary containing evaluation results and confidence intervals for each antibiotic.
     """
     results = {}
-    
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name)
+
+    if torch.cuda.is_available():
+        model.cuda()
+
+    optimizer = AdamW(model.parameters(), lr=2e-5)
+    batch_size = 16
+    epochs = 5
+
     for antibiotic in tqdm(antibiotics, desc="Iterating through Antibiotics Progress: "):
-        y_train = train[antibiotic].astype(int).reset_index(drop=True)
-        y_test = test[antibiotic].astype(int).reset_index(drop=True)
-        
-        # Fine-tuning
-        model = AutoModel.from_pretrained(model_name)
-        optimizer = AdamW(model.parameters(), lr=2e-5)
-        num_training_steps = len(X_train) * epochs
+        y_train = torch.tensor(train[antibiotic].values).long()
+        y_test = torch.tensor(test[antibiotic].values).long()
+        if torch.cuda.is_available():
+            y_train, y_test = y_train.cuda(), y_test.cuda()
+
+        num_training_steps = (len(X_train) // batch_size + 1) * epochs
         lr_scheduler = get_scheduler(
             "linear",
             optimizer=optimizer,
             num_warmup_steps=0,
             num_training_steps=num_training_steps
         )
-        
+
         model.train()
-        for epoch in range(epochs):
+        for epoch in tqdm(range(epochs), desc="finetune epochs"):
             for i in range(0, len(X_train), batch_size):
                 batch_texts = X_train[i:i+batch_size]
                 batch_labels = y_train[i:i+batch_size]
-                
-                _ = encode_texts(model_name, batch_texts, batch_labels, fine_tune=True)
-                
+
+                encoded_input = tokenizer(batch_texts, return_tensors='pt', padding=True, truncation=True)
+                if torch.cuda.is_available():
+                    encoded_input = {key: val.to('cuda') for key, val in encoded_input.items()}
+
+                outputs = model(**encoded_input, labels=batch_labels)
+                loss = outputs.loss
+                loss.backward()
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
-        
-        # Generate embeddings using fine-tuned model
-        X_train_embeddings = encode_texts(model_name, X_train)
-        X_test_embeddings = encode_texts(model_name, X_test)
-        
-        # Train LightGBM classifier
+
+        model.eval()
+        with torch.no_grad():
+            encoded_train = tokenizer(X_train, return_tensors='pt', padding=True, truncation=True, max_length=512)
+            encoded_test = tokenizer(X_test, return_tensors='pt', padding=True, truncation=True, max_length=512)
+            if torch.cuda.is_available():
+                encoded_train = {key: val.to('cuda') for key, val in encoded_train.items()}
+                encoded_test = {key: val.to('cuda') for key, val in encoded_test.items()}
+
+            train_embeddings = model(**encoded_train).logits.detach().cpu().numpy()
+            test_embeddings = model(**encoded_test).logits.detach().cpu().numpy()
+
         lgbm_model = LGBMClassifier(n_estimators=1000, learning_rate=0.05, num_leaves=30)
-        lgbm_model.fit(X_train_embeddings, y_train)
-        
-        # Predict using LightGBM
-        y_test_proba = lgbm_model.predict_proba(X_test_embeddings)[:, 1]
-        
-        # The rest of the evaluation code remains the same
-        precision, recall, thresholds = precision_recall_curve(y_test, y_test_proba)
+        lgbm_model.fit(train_embeddings, y_train.cpu().numpy())
+
+        y_test_proba = lgbm_model.predict_proba(test_embeddings)[:, 1]
+        precision, recall, thresholds = precision_recall_curve(y_test.cpu().numpy(), y_test_proba)
         f1_scores = 2 * recall * precision / (recall + precision)
-        f1_scores = np.nan_to_num(f1_scores)
         optimal_idx = np.argmax(f1_scores)
         optimal_threshold = thresholds[optimal_idx]
         optimal_f1 = f1_scores[optimal_idx]
         y_test_pred = (y_test_proba >= optimal_threshold).astype(int)
-        mcc_test = matthews_corrcoef(y_test, y_test_pred)
-        roc_auc_test = roc_auc_score(y_test, y_test_proba)
-        prc_auc_test = average_precision_score(y_test, y_test_proba)
-        fpr, tpr, _ = roc_curve(y_test, y_test_proba)
+        mcc_test = matthews_corrcoef(y_test.cpu().numpy(), y_test_pred)
+        roc_auc_test = roc_auc_score(y_test.cpu().numpy(), y_test_proba)
+        prc_auc_test = average_precision_score(y_test.cpu().numpy(), y_test_proba)
+        fpr, tpr, _ = roc_curve(y_test.cpu().numpy(), y_test_proba)
         auprc = auc(recall, precision)
 
         # Bootstrap confidence intervals
@@ -148,13 +172,12 @@ def evaluate_antibiotics_with_confidence_intervals(X_train, X_test, train, test,
             y_test_resampled = y_test[indices]
             y_test_proba_resampled = y_test_proba[indices]
 
-            roc_aucs.append(roc_auc_score(y_test_resampled, y_test_proba_resampled))
-            pr, rc, _ = precision_recall_curve(y_test_resampled, y_test_proba_resampled)
+            roc_aucs.append(roc_auc_score(y_test_resampled.cpu().numpy(), y_test_proba_resampled))
+            pr, rc, _ = precision_recall_curve(y_test_resampled.cpu().numpy(), y_test_proba_resampled)
             prc_aucs.append(auc(rc, pr))
             f1 = 2 * rc * pr / (np.maximum(rc + pr, np.finfo(float).eps))
             f1_scores_list.append(np.max(f1))
 
-        # Store results including confidence intervals
         results[antibiotic] = {
             'Optimal Threshold': optimal_threshold,
             'Test Metrics': {
@@ -174,8 +197,9 @@ def evaluate_antibiotics_with_confidence_intervals(X_train, X_test, train, test,
                 'F1 Score': {'Mean': np.mean(f1_scores_list), '95% CI': np.percentile(f1_scores_list, [2.5, 97.5])}
             }
         }
-    
+
     return results
+
 
 def print_results(results):
     # Print results
