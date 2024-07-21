@@ -142,9 +142,10 @@ def evaluate_antibiotics_with_confidence_intervals(X_train_texts, X_test_texts, 
         best_val_loss = float('inf')
         epochs_without_improvement = 0
 
-        for epoch in range(num_epochs):
+        for epoch in tqdm(range(num_epochs), desc="Training"):
+            tqdm.write(f"Epoch {epoch+1}/{num_epochs}")
             model.train()
-            for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+            for batch in train_loader:
                 inputs = {k: v.to(device) for k, v in batch[0].items()}
                 labels = batch[1].to(device)
                 outputs = model(**inputs, labels=labels)
