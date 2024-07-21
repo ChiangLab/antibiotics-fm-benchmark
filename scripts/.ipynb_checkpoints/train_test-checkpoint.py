@@ -70,13 +70,12 @@ def evaluate_antibiotics(X_train, X_test, train, test, antibiotics):
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader, Dataset, random_split
 from sklearn.metrics import (precision_recall_curve, matthews_corrcoef, roc_auc_score,
                              average_precision_score, roc_curve, auc)
 from sklearn.utils import resample
 from tqdm import tqdm
-from transformers import (AutoModelForSequenceClassification, AutoTokenizer, 
-                          TrainingArguments, Trainer, DataCollatorWithPadding)
-from torch.utils.data import Dataset
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 class AntibioticDataset(Dataset):
     def __init__(self, texts, labels, tokenizer):
@@ -88,70 +87,101 @@ class AntibioticDataset(Dataset):
         return len(self.texts)
 
     def __getitem__(self, idx):
-        encoding = self.tokenizer(self.texts[idx], truncation=True, padding='max_length', max_length=512)
-        encoding['labels'] = self.labels[idx]
-        return encoding
+        encoding = self.tokenizer(self.texts[idx], truncation=True, padding='max_length', max_length=512, return_tensors='pt')
+        return {key: val.squeeze(0) for key, val in encoding.items()}, torch.tensor(self.labels[idx])
+
+def evaluate_model(model, data_loader, device):
+    model.eval()
+    total_loss = 0
+    all_preds = []
+    all_labels = []
+    with torch.no_grad():
+        for batch in data_loader:
+            inputs = {k: v.to(device) for k, v in batch[0].items()}
+            labels = batch[1].to(device)
+            outputs = model(**inputs, labels=labels)
+            total_loss += outputs.loss.item()
+            preds = torch.argmax(outputs.logits, dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+    accuracy = np.mean(np.array(all_preds) == np.array(all_labels))
+    return total_loss / len(data_loader), accuracy
 
 def evaluate_antibiotics_with_confidence_intervals(X_train_texts, X_test_texts, train, test, antibiotics, model_name, n_bootstraps=1000):
-    """
-    Function to fine-tune a pre-trained model, generate embeddings, and evaluate antibiotics,
-    including confidence intervals for metrics using bootstrapping.
-    
-    Parameters:
-    - X_train_texts: List of training text data
-    - X_test_texts: List of test text data
-    - train: Training dataset containing the targets
-    - test: Testing dataset containing the targets
-    - antibiotics: List of antibiotics to evaluate
-    - model_name: Name of the pre-trained model to use
-    - n_bootstraps: Number of bootstrap samples to use for confidence intervals
-    
-    Returns:
-    - A dictionary containing evaluation results and confidence intervals for each antibiotic.
-    """
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     results = {}
 
     for antibiotic in tqdm(antibiotics, desc="Processing antibiotics"):
         print(f"Fine-tuning and evaluating for {antibiotic}")
         
         # Prepare data
-        y_train = train[antibiotic].astype(int).reset_index(drop=True)
-        y_test = test[antibiotic].astype(int).reset_index(drop=True)
+        y_train = train[antibiotic].astype(int).values
+        y_test = test[antibiotic].astype(int).values
 
-        # Create datasets
-        train_dataset = AntibioticDataset(X_train_texts, y_train, tokenizer)
+        # Create datasets and dataloaders
+        full_train_dataset = AntibioticDataset(X_train_texts, y_train, tokenizer)
         test_dataset = AntibioticDataset(X_test_texts, y_test, tokenizer)
+        
+        # Split training data into train and validation
+        train_size = int(0.9 * len(full_train_dataset))
+        val_size = len(full_train_dataset) - train_size
+        train_dataset, val_dataset = random_split(full_train_dataset, [train_size, val_size])
+
+        train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=64)
+        test_loader = DataLoader(test_dataset, batch_size=64)
 
         # Load model
-        model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
+        model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2).to(device)
 
-        # Training arguments
-        training_args = TrainingArguments(
-            output_dir=f'./results_{antibiotic}',
-            num_train_epochs=3,
-            per_device_train_batch_size=16,
-            per_device_eval_batch_size=64,
-            warmup_steps=500,
-            weight_decay=0.01,
-            logging_dir=f'./logs_{antibiotic}',
-        )
+        # Training loop with early stopping
+        optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
+        num_epochs = 10
+        patience = 3
+        best_val_loss = float('inf')
+        epochs_without_improvement = 0
 
-        # Initialize Trainer
-        trainer = Trainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_dataset,
-            eval_dataset=test_dataset,
-            tokenizer=tokenizer,
-            data_collator=DataCollatorWithPadding(tokenizer=tokenizer)
-        )
+        for epoch in range(num_epochs):
+            model.train()
+            for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+                inputs = {k: v.to(device) for k, v in batch[0].items()}
+                labels = batch[1].to(device)
+                outputs = model(**inputs, labels=labels)
+                loss = outputs.loss
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
 
-        # Fine-tune the model
-        trainer.train()
+            # Evaluate on validation set
+            val_loss, val_accuracy = evaluate_model(model, val_loader, device)
+            print(f"Epoch {epoch+1}/{num_epochs}, Validation Loss: {val_loss:.4f}, Validation Accuracy: {val_accuracy:.4f}")
 
-        # Evaluate
-        y_test_proba = trainer.predict(test_dataset).predictions[:, 1]
+            # Early stopping
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                epochs_without_improvement = 0
+                # Save the best model
+                torch.save(model.state_dict(), f'best_model_{antibiotic}.pt')
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= patience:
+                    print(f"Early stopping triggered after {epoch+1} epochs")
+                    break
+
+        # Load the best model for evaluation
+        model.load_state_dict(torch.load(f'best_model_{antibiotic}.pt'))
+
+        # Evaluation
+        model.eval()
+        y_test_proba = []
+        with torch.no_grad():
+            for batch in test_loader:
+                inputs = {k: v.to(device) for k, v in batch[0].items()}
+                outputs = model(**inputs)
+                y_test_proba.extend(torch.softmax(outputs.logits, dim=1)[:, 1].cpu().numpy())
+
+        y_test_proba = np.array(y_test_proba)
 
         # Calculate metrics
         precision, recall, thresholds = precision_recall_curve(y_test, y_test_proba)
